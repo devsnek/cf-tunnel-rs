@@ -1,0 +1,30 @@
+[package]
+name = "cf-tunnel"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+quinn = { version = "0.10", features = ["futures-io"] }
+tokio = { version = "1.34", features = ["full"] }
+hickory-resolver = "0.24"
+rustls = "0.21.0" # pinned for quinn
+rustls-native-certs = "0.7"
+reqwest = { version = "0.11", features = ["json"] }
+serde = { version = "1.0", features = ["derive"] }
+rustls-pemfile = "2.0.0"
+capnp = "0.18"
+capnp-rpc = "0.18"
+capnp-futures = "0.18"
+thiserror = "1.0"
+uuid = { version = "1.6", features = ["v4"] }
+base64 = "0.21"
+async-compat = "0.2"
+http = "1.0"
+http-body = "1.0"
+http-body-util = "0.1"
+bytes = "1.5"
+
+[build-dependencies]
+capnpc = "0.18"
