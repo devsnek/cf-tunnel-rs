@@ -3,6 +3,7 @@ use async_compat::CompatExt;
 use capnp_rpc::{rpc_twoparty_capnp::Side, twoparty::VatNetwork, RpcSystem};
 use std::marker::Unpin;
 use tokio::io::{AsyncRead, AsyncWrite};
+use uuid::Uuid;
 
 pub(crate) mod tunnelrpc_capnp {
     #![allow(unused)]
@@ -26,6 +27,7 @@ enum RpcTransfer {
     },
 }
 
+#[derive(Debug)]
 pub struct RpcClient {
     sender: tokio::sync::mpsc::Sender<RpcTransfer>,
 }
@@ -146,22 +148,22 @@ impl RpcClient {
     // registerConnection @0 (auth :TunnelAuth, tunnelId :Data, connIndex :UInt8, options :ConnectionOptions) -> (result :ConnectionResponse);
     pub async fn register_connection(
         &self,
-        account_tag: String,
-        tunnel_secret: Vec<u8>,
-        tunnel_id: Vec<u8>,
+        account_tag: &str,
+        tunnel_secret: &[u8],
+        tunnel_id: &Uuid,
         conn_index: u8,
-        client_id: Vec<u8>,
+        client_id: &Uuid,
     ) -> Result<RegisterConnectionResponse, Error> {
         let (tx, rx) = tokio::sync::oneshot::channel();
 
         self.sender
             .send(RpcTransfer::RegisterConnection {
                 args: RegisterConnectionRequest {
-                    account_tag,
-                    tunnel_secret,
-                    tunnel_id,
+                    account_tag: account_tag.to_owned(),
+                    tunnel_secret: tunnel_secret.to_owned(),
+                    tunnel_id: tunnel_id.into_bytes().to_vec(),
                     conn_index,
-                    client_id,
+                    client_id: client_id.into_bytes().to_vec(),
                 },
                 tx,
             })

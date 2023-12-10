@@ -45,3 +45,17 @@ pub async fn create_try_tunnel() -> Result<TryTunnel, Error> {
         secret,
     })
 }
+
+impl crate::IntoTunnelConfig for TryTunnel {
+    fn account_tag(&self) -> &str {
+        &self.account_tag
+    }
+
+    fn secret(&self) -> &[u8] {
+        &self.secret
+    }
+
+    fn id(&self) -> &Uuid {
+        &self.id
+    }
+}

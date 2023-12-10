@@ -1,43 +1,47 @@
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
-    #[error("{0}")]
+    #[error(transparent)]
     ResolveError(#[from] hickory_resolver::error::ResolveError),
-    #[error("{0}")]
+    #[error(transparent)]
     Rustls(#[from] rustls::Error),
-    #[error("{0}")]
+    #[error(transparent)]
     StdIo(#[from] std::io::Error),
-    #[error("{0}")]
+    #[error(transparent)]
     ConnectError(#[from] quinn::ConnectError),
-    #[error("{0}")]
+    #[error(transparent)]
     ConnectionError(#[from] quinn::ConnectionError),
-    #[error("{0}")]
+    #[error(transparent)]
     ReadExactError(#[from] quinn::ReadExactError),
-    #[error("{0}")]
+    #[error(transparent)]
     Capnp(#[from] capnp::Error),
-    #[error("{0}")]
+    #[error(transparent)]
     NotInSchema(#[from] capnp::NotInSchema),
-    #[error("{0}")]
+    #[error(transparent)]
     Utf8Error(#[from] std::str::Utf8Error),
-    #[error("{0}")]
+    #[error(transparent)]
     RecvError(#[from] tokio::sync::oneshot::error::RecvError),
-    #[error("{0}")]
+    #[error(transparent)]
     ReadError(#[from] quinn::ReadError),
-    #[error("{0}")]
+    #[error(transparent)]
     WriteError(#[from] quinn::WriteError),
-    #[error("{0}")]
-    InvalidMethod(#[from] http::method::InvalidMethod),
-    #[error("{0}")]
-    HttpError(#[from] http::Error),
-    #[error("{0}")]
+    #[error(transparent)]
     ParseIntError(#[from] std::num::ParseIntError),
-    #[error("{0}")]
-    ToStrError(#[from] http::header::ToStrError),
-    #[error("{0}")]
+    #[error(transparent)]
     Reqwest(#[from] reqwest::Error),
-    #[error("{0}")]
+    #[error(transparent)]
     Uuid(#[from] uuid::Error),
-    #[error("{0}")]
+    #[error(transparent)]
     DecodeError(#[from] base64::DecodeError),
+    #[error(transparent)]
+    InvalidMethod(#[from] hyper::http::method::InvalidMethod),
+    #[error(transparent)]
+    ToStrError(#[from] hyper::header::ToStrError),
+    #[error(transparent)]
+    HttpError(#[from] hyper::http::Error),
     #[error("RPC Error: {0}")]
     RpcError(String),
+    #[error("Version mismatch")]
+    VersionMismatch,
+    #[error("No method")]
+    NoMethod,
 }

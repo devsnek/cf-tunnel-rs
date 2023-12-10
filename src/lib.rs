@@ -1,11 +1,12 @@
 use std::net::SocketAddr;
 use uuid::Uuid;
+use rand::{thread_rng, seq::SliceRandom};
 
 mod config;
 mod error;
 mod quic;
 mod rpc;
-mod try_tunnel;
+pub mod try_tunnel;
 
 // capnp assumes that it exists at the root of the crate :/
 use quic::quic_metadata_protocol_capnp;
@@ -46,42 +47,37 @@ pub struct Tunnel {
 impl Tunnel {
     pub async fn new() -> Result<Self, Error> {
         let edge_addrs = edge_discovery().await?;
-
         let uuid = Uuid::new_v4();
 
         Ok(Tunnel { edge_addrs, uuid })
     }
 
-    pub async fn test(&self) -> Result<(), Error> {
-        let try_tunnel = try_tunnel::create_try_tunnel().await.unwrap();
-        println!("https://{}", try_tunnel.hostname);
+    pub async fn serve(&self, config: &impl IntoTunnelConfig) -> Result<(), Error> {
+        let mut rng = thread_rng();
+        let edge_addr = self.edge_addrs.choose(&mut rng).unwrap().clone();
 
-        let quic = quic::Quic::connect(self.edge_addrs[0]).await.unwrap();
+        let quic = quic::Quic::connect(edge_addr).await?;
 
-        quic.register_connection(
-            &try_tunnel.account_tag,
-            &try_tunnel.secret,
-            &try_tunnel.id,
-            0,
-            &self.uuid,
-        )
-        .await?;
+        quic.rpc
+            .register_connection(
+                config.account_tag(),
+                config.secret(),
+                config.id(),
+                0,
+                &self.uuid,
+            )
+            .await?;
 
-        quic.serve().await?;
+        let r = quic.serve().await;
 
-        Ok(())
+        quic.rpc.unregister_connection().await?;
+
+        r
     }
 }
 
-pub type BoxBody =
-    http_body_util::combinators::UnsyncBoxBody<bytes::Bytes, std::convert::Infallible>;
-
-async fn handle_http_request(
-    req: http::request::Request<BoxBody>,
-) -> Result<http::response::Response<BoxBody>, Error> {
-    let (_head, body) = req.into_parts();
-    Ok(http::response::Response::builder()
-        .status(200)
-        .body(body)
-        .unwrap())
+pub trait IntoTunnelConfig {
+    fn account_tag(&self) -> &str;
+    fn secret(&self) -> &[u8];
+    fn id(&self) -> &Uuid;
 }
