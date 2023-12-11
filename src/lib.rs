@@ -1,6 +1,6 @@
+use rand::{seq::SliceRandom, thread_rng};
 use std::net::SocketAddr;
 use uuid::Uuid;
-use rand::{thread_rng, seq::SliceRandom};
 
 mod config;
 mod error;
@@ -44,6 +44,8 @@ pub struct Tunnel {
     uuid: Uuid,
 }
 
+pub type HttpBody = http_body_util::combinators::BoxBody<bytes::Bytes, std::convert::Infallible>;
+
 impl Tunnel {
     pub async fn new() -> Result<Self, Error> {
         let edge_addrs = edge_discovery().await?;
@@ -52,7 +54,13 @@ impl Tunnel {
         Ok(Tunnel { edge_addrs, uuid })
     }
 
-    pub async fn serve(&self, config: &impl IntoTunnelConfig) -> Result<(), Error> {
+    pub async fn serve<S>(&self, config: &impl IntoTunnelConfig, service: S) -> Result<(), Error>
+    where
+        S: tower::Service<hyper::Request<HttpBody>> + Send + Clone + 'static,
+        S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+        S::Response: Into<hyper::Response<HttpBody>> + Send,
+        S::Future: Send,
+    {
         let mut rng = thread_rng();
         let edge_addr = self.edge_addrs.choose(&mut rng).unwrap().clone();
 
@@ -68,7 +76,7 @@ impl Tunnel {
             )
             .await?;
 
-        let r = quic.serve().await;
+        let r = quic.serve(service).await;
 
         quic.rpc.unregister_connection().await?;
 

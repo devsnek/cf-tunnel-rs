@@ -1,7 +1,7 @@
-use crate::{rpc::RpcClient, Error};
+use crate::{rpc::RpcClient, Error, HttpBody};
 use async_compat::CompatExt;
 use futures::TryFutureExt;
-use http_body_util::BodyExt;
+use http_body_util::{combinators::BoxBody, BodyExt, Empty as EmptyBody, Full as FullBody};
 use std::{collections::HashMap, net::SocketAddr};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -39,8 +39,6 @@ pub async fn connect_quic(remote: SocketAddr) -> Result<quinn::Connection, Error
 
     Ok(conn)
 }
-
-use http_body_util::{combinators::BoxBody, Empty as EmptyBody, Full as FullBody};
 
 async fn build_http_request(
     uri: String,
@@ -94,7 +92,13 @@ impl Quic {
         Ok(Self { conn, rpc, inner })
     }
 
-    pub async fn serve(&self) -> Result<(), Error> {
+    pub async fn serve<S>(&self, service: S) -> Result<(), Error>
+    where
+        S: tower::Service<hyper::Request<HttpBody>> + Send + Clone + 'static,
+        S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+        S::Response: Into<hyper::Response<HttpBody>> + Send,
+        S::Future: Send,
+    {
         loop {
             let (tx, mut rx) = self.conn.accept_bi().await?;
 
@@ -103,8 +107,9 @@ impl Quic {
 
             if sig == DATA_SIG {
                 let inner = self.inner.clone();
+                let service = service.clone();
                 tokio::task::spawn(async move {
-                    inner.handle_data_stream(tx, rx).await.unwrap();
+                    inner.handle_data_stream(tx, rx, service).await.unwrap();
                 });
             } else if sig == RPC_SIG {
                 unimplemented!("RPC STREAM!");
@@ -119,11 +124,17 @@ impl Quic {
 struct QuicInner {}
 
 impl QuicInner {
-    async fn handle_data_stream(
+    async fn handle_data_stream<S>(
         &self,
         mut tx: impl AsyncWrite + Send + Sync + Unpin,
         mut rx: impl AsyncRead + Send + Sync + Unpin,
-    ) -> Result<(), Error> {
+        mut service: S,
+    ) -> Result<(), Error>
+    where
+        S: tower::Service<hyper::Request<HttpBody>> + Send,
+        S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+        S::Response: Into<hyper::Response<HttpBody>>,
+    {
         let mut v = [0; 2];
         rx.read_exact(&mut v).await?;
         if v != VERSION {
@@ -149,47 +160,55 @@ impl QuicInner {
                 }
                 drop(r);
 
-                let result = build_http_request(uri, metadata, &mut rx)
-                    .map_ok(|req| {
-                        // TODO: call service
-                        let (_head, body) = req.into_parts();
-                        hyper::Response::builder().status(200).body(body).unwrap()
-                    })
-                    .and_then(|res| async {
-                        let mut builder = capnp::message::TypedBuilder::<
-                            quic_metadata_protocol_capnp::connect_response::Owned,
-                        >::new_default();
+                let result: Result<_, Box<dyn std::error::Error + Send + Sync>> =
+                    build_http_request(uri, metadata, &mut rx)
+                        .err_into()
+                        .and_then(|req| async {
+                            match service.call(req).await {
+                                Ok(res) => Ok(res),
+                                Err(e) => Err(e.into()),
+                            }
+                        })
+                        .and_then(|res| async {
+                            let mut builder = capnp::message::TypedBuilder::<
+                                quic_metadata_protocol_capnp::connect_response::Owned,
+                            >::new_default();
 
-                        let (mut head, body) = res.into_parts();
+                            let (mut head, body) = res.into().into_parts();
 
-                        let body = body.collect().await.unwrap().to_bytes();
+                            let body = match body.collect().await {
+                                Ok(body) => body.to_bytes(),
+                                Err(e) => {
+                                    return Err(e.into());
+                                }
+                            };
 
-                        head.headers.insert(
-                            "Content-Length",
-                            hyper::header::HeaderValue::from_str(
-                                format!("{}", body.len()).as_str(),
-                            )
-                            .unwrap(),
-                        );
+                            head.headers.insert(
+                                "Content-Length",
+                                hyper::header::HeaderValue::from_str(
+                                    format!("{}", body.len()).as_str(),
+                                )
+                                .unwrap(),
+                            );
 
-                        let root = builder.init_root();
-                        let mut m = root.init_metadata((head.headers.len() + 1) as _);
+                            let root = builder.init_root();
+                            let mut m = root.init_metadata((head.headers.len() + 1) as _);
 
-                        let mut entry = m.reborrow().get(0);
-                        entry.set_key("HttpStatus".into());
-                        entry.set_val(format!("{}", head.status.as_u16()).as_str().into());
+                            let mut entry = m.reborrow().get(0);
+                            entry.set_key("HttpStatus".into());
+                            entry.set_val(format!("{}", head.status.as_u16()).as_str().into());
 
-                        let mut i = 1;
-                        for (k, v) in head.headers.iter() {
-                            let mut entry = m.reborrow().get(i);
-                            i += 1;
-                            entry.set_key(format!("HttpHeader:{}", k.as_str()).as_str().into());
-                            entry.set_val(v.to_str()?.into());
-                        }
+                            let mut i = 1;
+                            for (k, v) in head.headers.iter() {
+                                let mut entry = m.reborrow().get(i);
+                                i += 1;
+                                entry.set_key(format!("HttpHeader:{}", k.as_str()).as_str().into());
+                                entry.set_val(v.to_str()?.into());
+                            }
 
-                        Ok((builder, body))
-                    })
-                    .await;
+                            Ok((builder, body))
+                        })
+                        .await;
 
                 tx.write_all(&DATA_SIG).await?;
                 tx.write_all(&VERSION).await?;
