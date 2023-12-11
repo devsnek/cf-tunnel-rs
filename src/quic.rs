@@ -55,8 +55,9 @@ async fn build_http_request(
 
     for (k, v) in &metadata {
         if k.starts_with("HttpHeader") {
-            let key = k.split(':').nth(1).unwrap();
-            builder = builder.header(key, v);
+            if let Some(key) = k.split(':').nth(1) {
+                builder = builder.header(key, v);
+            }
         }
     }
 

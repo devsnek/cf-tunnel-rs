@@ -44,4 +44,8 @@ pub enum Error {
     VersionMismatch,
     #[error("No method")]
     NoMethod,
+    #[error("Send error")]
+    SendError,
+    #[error("Edge discovery found zero addresses")]
+    EdgeDiscoveryFailed,
 }

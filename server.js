@@ -12,7 +12,9 @@ http.createServer((req, res) => {
         return r.body;
       })
       .then((body) => pipeline(body, res));
-  } else {
+  } else if (req.method === 'GET') {
     res.end('hi!');
+  } else {
+    req.pipe(res);
   }
 }).listen(8080);

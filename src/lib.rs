@@ -36,7 +36,11 @@ async fn edge_discovery() -> Result<Vec<SocketAddr>, Error> {
         }
     }
 
-    Ok(result)
+    if result.is_empty() {
+        Err(Error::EdgeDiscoveryFailed)
+    } else {
+        Ok(result)
+    }
 }
 
 pub struct Tunnel {

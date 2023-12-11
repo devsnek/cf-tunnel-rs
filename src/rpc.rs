@@ -168,7 +168,7 @@ impl RpcClient {
                 tx,
             })
             .await
-            .unwrap();
+            .map_err(|_| Error::SendError)?;
 
         rx.await?
     }
@@ -180,7 +180,7 @@ impl RpcClient {
         self.sender
             .send(RpcTransfer::UnregisterConnection { tx })
             .await
-            .unwrap();
+            .map_err(|_| Error::SendError)?;
 
         rx.await?
     }
@@ -192,7 +192,7 @@ impl RpcClient {
         self.sender
             .send(RpcTransfer::UpdateLocalConfiguration { config, tx })
             .await
-            .unwrap();
+            .map_err(|_| Error::SendError)?;
 
         rx.await?
     }
