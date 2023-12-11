@@ -35,7 +35,7 @@ struct ProxyService {
 
 impl tower::Service<http::Request<cf_tunnel::HttpBody>> for ProxyService {
     type Response = http::Response<cf_tunnel::HttpBody>;
-    type Error = std::convert::Infallible;
+    type Error = std::io::Error;
     type Future = std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
     >;
@@ -93,13 +93,18 @@ impl tower::Service<http::Request<cf_tunnel::HttpBody>> for ProxyService {
                 );
             }
 
+            use futures::StreamExt;
+            let stream = resw.bytes_stream().map(|result| match result {
+                Ok(v) => Ok(hyper::body::Frame::data(v)),
+                Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
+            });
             let res = res
-                .body(cf_tunnel::HttpBody::new(http_body_util::Full::new(
-                    resw.bytes().await.unwrap(),
+                .body(cf_tunnel::HttpBody::new(http_body_util::StreamBody::new(
+                    stream,
                 )))
                 .unwrap();
 
-            Ok::<_, std::convert::Infallible>(res)
+            Ok(res)
         };
 
         Box::pin(f)

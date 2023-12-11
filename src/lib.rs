@@ -44,7 +44,7 @@ pub struct Tunnel {
     uuid: Uuid,
 }
 
-pub type HttpBody = http_body_util::combinators::BoxBody<bytes::Bytes, std::convert::Infallible>;
+pub type HttpBody = http_body_util::combinators::BoxBody<bytes::Bytes, std::io::Error>;
 
 impl Tunnel {
     pub async fn new() -> Result<Self, Error> {
@@ -62,9 +62,9 @@ impl Tunnel {
         S::Future: Send,
     {
         let mut rng = thread_rng();
-        let edge_addr = self.edge_addrs.choose(&mut rng).unwrap().clone();
+        let edge_addr = self.edge_addrs.choose(&mut rng).unwrap();
 
-        let quic = quic::Quic::connect(edge_addr).await?;
+        let quic = quic::Quic::connect(*edge_addr).await?;
 
         quic.rpc
             .register_connection(

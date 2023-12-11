@@ -2,7 +2,8 @@ use crate::{rpc::RpcClient, Error, HttpBody};
 use async_compat::CompatExt;
 use futures::TryFutureExt;
 use http_body_util::{combinators::BoxBody, BodyExt, Empty as EmptyBody, Full as FullBody};
-use std::{collections::HashMap, net::SocketAddr};
+use hyper::{body::Body, http::Method, Request, Response};
+use std::{collections::HashMap, net::SocketAddr, pin::Pin};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub(crate) mod quic_metadata_protocol_capnp {
@@ -44,13 +45,13 @@ async fn build_http_request(
     uri: String,
     metadata: HashMap<String, String>,
     mut rx: impl AsyncRead + Send + Sync + Unpin,
-) -> Result<hyper::Request<BoxBody<bytes::Bytes, std::convert::Infallible>>, Error> {
+) -> Result<Request<HttpBody>, Error> {
     let Some(method) = metadata.get("HttpMethod") else {
         return Err(Error::NoMethod);
     };
-    let method = hyper::Method::from_bytes(method.as_bytes())?;
+    let method = Method::from_bytes(method.as_bytes())?;
 
-    let mut builder = hyper::Request::builder().uri(uri).method(method);
+    let mut builder = Request::builder().uri(uri).method(method);
 
     for (k, v) in &metadata {
         if k.starts_with("HttpHeader") {
@@ -62,9 +63,14 @@ async fn build_http_request(
     let body = if let Some(len) = metadata.get("HttpHeader:Content-Length") {
         let mut body = vec![0; len.parse()?];
         rx.read_exact(&mut body).await?;
-        BoxBody::new(FullBody::new(body.into()))
+        BoxBody::new(
+            FullBody::new(body.into())
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
+        )
     } else {
-        BoxBody::new(EmptyBody::new())
+        BoxBody::new(
+            EmptyBody::new().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
+        )
     };
 
     let req = builder.body(body)?;
@@ -94,9 +100,9 @@ impl Quic {
 
     pub async fn serve<S>(&self, service: S) -> Result<(), Error>
     where
-        S: tower::Service<hyper::Request<HttpBody>> + Send + Clone + 'static,
+        S: tower::Service<Request<HttpBody>> + Send + Clone + 'static,
         S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-        S::Response: Into<hyper::Response<HttpBody>> + Send,
+        S::Response: Into<Response<HttpBody>> + Send,
         S::Future: Send,
     {
         loop {
@@ -131,9 +137,9 @@ impl QuicInner {
         mut service: S,
     ) -> Result<(), Error>
     where
-        S: tower::Service<hyper::Request<HttpBody>> + Send,
+        S: tower::Service<Request<HttpBody>> + Send,
         S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-        S::Response: Into<hyper::Response<HttpBody>>,
+        S::Response: Into<Response<HttpBody>>,
     {
         let mut v = [0; 2];
         rx.read_exact(&mut v).await?;
@@ -174,22 +180,7 @@ impl QuicInner {
                                 quic_metadata_protocol_capnp::connect_response::Owned,
                             >::new_default();
 
-                            let (mut head, body) = res.into().into_parts();
-
-                            let body = match body.collect().await {
-                                Ok(body) => body.to_bytes(),
-                                Err(e) => {
-                                    return Err(e.into());
-                                }
-                            };
-
-                            head.headers.insert(
-                                "Content-Length",
-                                hyper::header::HeaderValue::from_str(
-                                    format!("{}", body.len()).as_str(),
-                                )
-                                .unwrap(),
-                            );
+                            let (head, body) = res.into().into_parts();
 
                             let root = builder.init_root();
                             let mut m = root.init_metadata((head.headers.len() + 1) as _);
@@ -214,14 +205,28 @@ impl QuicInner {
                 tx.write_all(&VERSION).await?;
 
                 match result {
-                    Ok((builder, body)) => {
+                    Ok((builder, mut body)) => {
                         capnp_futures::serialize::write_message(
                             &mut tx.compat_mut(),
                             builder.into_inner(),
                         )
                         .await?;
-                        if !body.is_empty() {
-                            tx.write_all(&body).await?;
+                        loop {
+                            let chunk =
+                                std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await;
+                            match chunk {
+                                Some(Ok(frame)) => {
+                                    if let Ok(data) = frame.into_data() {
+                                        tx.write_all(&data).await?;
+                                    }
+                                }
+                                Some(Err(_)) => {
+                                    unreachable!();
+                                }
+                                None => {
+                                    break;
+                                }
+                            }
                         }
                     }
                     Err(e) => {
