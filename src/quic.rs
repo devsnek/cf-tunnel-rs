@@ -40,14 +40,9 @@ async fn build_http_request(
     let body = if let Some(len) = metadata.get("HttpHeader:Content-Length") {
         let mut body = vec![0; len.parse()?];
         rx.read_exact(&mut body).await?;
-        BoxBody::new(
-            FullBody::new(body.into())
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
-        )
+        BoxBody::new(FullBody::new(body.into()).map_err(std::io::Error::other))
     } else {
-        BoxBody::new(
-            EmptyBody::new().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
-        )
+        BoxBody::new(EmptyBody::new().map_err(std::io::Error::other))
     };
 
     let req = builder.body(body)?;
@@ -67,10 +62,12 @@ fn create_tls_client_config() -> Result<rustls::ClientConfig, Error> {
         }
     }
 
-    let client_config = rustls::ClientConfig::builder()
+    let mut client_config = rustls::ClientConfig::builder()
         .with_safe_defaults()
         .with_root_certificates(roots)
         .with_no_client_auth();
+
+    client_config.key_log = Arc::new(rustls::KeyLogFile::new());
 
     Ok(client_config)
 }
@@ -92,7 +89,7 @@ impl Quic {
             .await?;
 
         let control_stream = conn.open_bi().await?;
-        let rpc = RpcClient::new(control_stream);
+        let rpc = RpcClient::new(control_stream.0, control_stream.1);
 
         let inner = QuicInner {};
 

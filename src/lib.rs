@@ -78,7 +78,7 @@ impl Tunnel {
             Protocol::Http2 => Box::new(http2::Http2::connect(*edge_addr).await?),
         };
 
-        conn.rpc()
+        let r = conn.rpc()
             .register_connection(
                 config.account_tag(),
                 config.secret(),
@@ -87,6 +87,7 @@ impl Tunnel {
                 &self.uuid,
             )
             .await?;
+        println!("Serving via {}", r.location);
 
         let r = conn.serve(tower::util::BoxCloneService::new(service)).await;
 
@@ -100,6 +101,18 @@ impl Tunnel {
 pub enum Protocol {
     Quic,
     Http2,
+}
+
+impl std::str::FromStr for Protocol {
+    type Err = std::io::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "quic" => Ok(Self::Quic),
+            "http2" => Ok(Self::Http2),
+            _ => Err(std::io::Error::other(Error::InvalidProtocol)),
+        }
+    }
 }
 
 #[async_trait::async_trait]

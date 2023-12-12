@@ -93,10 +93,8 @@ async fn update_local_connection(rpc: &RegistrationClient, config: Vec<u8>) -> R
 
 impl RpcClient {
     pub fn new(
-        (tx, rx): (
-            impl AsyncWrite + Unpin + Send + Sync + 'static,
-            impl AsyncRead + Unpin + Send + Sync + 'static,
-        ),
+        tx: impl AsyncWrite + Unpin + Send + Sync + 'static,
+        rx: impl AsyncRead + Unpin + Send + Sync + 'static,
     ) -> Self {
         let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
 
@@ -209,6 +207,6 @@ pub struct RegisterConnectionRequest {
 
 #[derive(Debug)]
 pub struct RegisterConnectionResponse {
-    uuid: Vec<u8>,
-    location: String,
+    pub uuid: Vec<u8>,
+    pub location: String,
 }

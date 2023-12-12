@@ -50,4 +50,6 @@ pub enum Error {
     SendError,
     #[error("Edge discovery found zero addresses")]
     EdgeDiscoveryFailed,
+    #[error("Invalid protocol, must be one of quic, http2")]
+    InvalidProtocol,
 }

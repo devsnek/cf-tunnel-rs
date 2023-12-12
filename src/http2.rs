@@ -2,7 +2,7 @@ use crate::{rpc::RpcClient, Error, HttpBody, HttpService};
 use bytes::Bytes;
 use futures::TryStreamExt;
 use h2::{
-    server::{Connection, SendResponse},
+    server::{SendResponse},
     RecvStream, SendStream,
 };
 use http_body_util::{BodyStream, StreamBody};
@@ -15,8 +15,7 @@ use std::{
 };
 use tokio::net::TcpStream;
 use tokio_rustls::{
-    client::TlsStream,
-    rustls::{pki_types::ServerName, ClientConfig, RootCertStore},
+    rustls::{pki_types::ServerName, ClientConfig, RootCertStore, KeyLogFile},
     TlsConnector,
 };
 use tokio_util::io::StreamReader;
@@ -38,13 +37,14 @@ fn create_tls_client_config() -> Result<ClientConfig, Error> {
         .with_no_client_auth();
 
     client_config.alpn_protocols = vec![b"h2".into()];
+    client_config.key_log = Arc::new(KeyLogFile::new());
 
     Ok(client_config)
 }
 
 #[derive(Debug)]
 pub struct Http2 {
-    h2: Connection<TlsStream<TcpStream>, Bytes>,
+    rx: tokio::sync::mpsc::Receiver<Result<(Request<RecvStream>, SendResponse<Bytes>), h2::Error>>,
     rpc: RpcClient,
     inner: Http2Inner,
 }
@@ -69,17 +69,25 @@ impl Http2 {
         let rpc = {
             let (request, mut send_response) = h2.accept().await.unwrap()?;
             let (_head, body) = request.into_parts();
-
+            let response = Response::builder()
+                .status(200)
+                .header("content-type", "application/octet-stream")
+                .body(())
+                .unwrap();
             let send_stream = send_response
-                .send_response(Response::builder().status(200).body(()).unwrap(), false)?;
+                .send_response(response, false)?;
 
-            RpcClient::new((
-                BodyWriter(send_stream),
-                StreamReader::new(RecvBodyStream(body)),
-            ))
+            RpcClient::new(BodyWriter(send_stream), StreamReader::new(RecvBodyStream(body)))
         };
 
-        Ok(Self { h2, rpc, inner })
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        tokio::task::spawn(async move {
+            while let Some(request) = h2.accept().await {
+                let _ = tx.send(request).await;
+            }
+        });
+
+        Ok(Self { rx, rpc, inner })
     }
 }
 
@@ -90,7 +98,7 @@ impl crate::ProtocolImpl for Http2 {
     }
 
     async fn serve(&mut self, service: HttpService) -> Result<(), Error> {
-        while let Some(request) = self.h2.accept().await {
+        while let Some(request) = self.rx.recv().await {
             let inner = self.inner.clone();
             let service = service.clone();
             tokio::spawn(async move {
@@ -123,9 +131,19 @@ impl Http2Inner {
             .and_then(|h| h.to_str().ok())
         {
             Some("control-stream") => {
-                unreachable!();
+                unreachable!("control");
+            }
+            Some("update-configuration") => {
+                unimplemented!("config");
+            }
+            Some("websocket") => {
+                unimplemented!("websocket");
             }
             _ => {
+                if request.headers().contains_key("cf-cloudflared-proxy-src") {
+                    unimplemented!("tcp");
+                }
+
                 let (head, body) = request.into_parts();
                 let body = HttpBody::new(StreamBody::new(RecvBodyStream(body).map_ok(Frame::data)));
                 let request = Request::from_parts(head, body);
@@ -156,27 +174,19 @@ impl tokio::io::AsyncWrite for BodyWriter {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, std::io::Error>> {
-        loop {
-            if self.0.capacity() < buf.len() {
-                self.0.reserve_capacity(buf.len());
-                match self.0.poll_capacity(cx) {
-                    Poll::Ready(Some(Ok(_))) => {
-                        continue;
-                    }
-                    Poll::Ready(Some(Err(e))) => {
-                        return Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e)));
-                    }
-                    Poll::Ready(None) => unreachable!(),
-                    Poll::Pending => {
-                        return Poll::Pending;
-                    }
-                }
-            }
-            break Poll::Ready(match self.0.send_data(buf.to_vec().into(), false) {
-                Ok(()) => Ok(buf.len()),
-                Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
-            });
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
         }
+        self.0.reserve_capacity(buf.len());
+        std::task::ready!(self.0.poll_capacity(cx))
+            .transpose()
+            .map_err(std::io::Error::other)?;
+        let size = std::cmp::min(buf.len(), self.0.capacity());
+        let buf = Bytes::copy_from_slice(&buf[0..size]);
+        self.0
+            .send_data(buf, false)
+            .map_err(std::io::Error::other)?;
+        Poll::Ready(Ok(size))
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
@@ -184,10 +194,14 @@ impl tokio::io::AsyncWrite for BodyWriter {
     }
 
     fn poll_shutdown(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
     ) -> Poll<Result<(), std::io::Error>> {
-        Poll::Ready(Ok(()))
+        Poll::Ready(
+            self.0
+                .send_data(Bytes::new(), false)
+                .map_err(std::io::Error::other),
+        )
     }
 }
 
@@ -195,13 +209,12 @@ struct RecvBodyStream(RecvStream);
 
 impl futures::Stream for RecvBodyStream {
     type Item = Result<Bytes, std::io::Error>;
+
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let Poll::Ready(r) = self.0.poll_data(cx) else {
-            return Poll::Pending;
-        };
+        let r = std::task::ready!(self.0.poll_data(cx));
         Poll::Ready(match r {
             Some(Ok(v)) => Some(Ok(v)),
-            Some(Err(e)) => Some(Err(std::io::Error::new(std::io::ErrorKind::Other, e))),
+            Some(Err(e)) => Some(Err(std::io::Error::other(e))),
             None => None,
         })
     }

@@ -24,7 +24,11 @@ impl std::str::FromStr for ProxyUrl {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    Try { url: ProxyUrl },
+    Try {
+        url: ProxyUrl,
+        #[arg(short, long)]
+        protocol: Option<cf_tunnel::Protocol>
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -96,7 +100,7 @@ impl tower::Service<http::Request<cf_tunnel::HttpBody>> for ProxyService {
             use futures::StreamExt;
             let stream = resw.bytes_stream().map(|result| match result {
                 Ok(v) => Ok(hyper::body::Frame::data(v)),
-                Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
+                Err(e) => Err(std::io::Error::other(e)),
             });
             let res = res
                 .body(cf_tunnel::HttpBody::new(http_body_util::StreamBody::new(
@@ -116,7 +120,7 @@ async fn main() {
     let args = Args::parse();
 
     match args.command {
-        Command::Try { url } => {
+        Command::Try { url, protocol } => {
             let try_tunnel = cf_tunnel::try_tunnel::create_try_tunnel().await.unwrap();
 
             let tunnel = cf_tunnel::Tunnel::new().await.unwrap();
@@ -129,7 +133,7 @@ async fn main() {
             };
 
             tunnel
-                .serve(&try_tunnel, cf_tunnel::HttpService::new(service), None)
+                .serve(&try_tunnel, cf_tunnel::HttpService::new(service), protocol)
                 .await
                 .unwrap();
         }
