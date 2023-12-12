@@ -1,10 +1,11 @@
-use crate::{rpc::RpcClient, Error, HttpBody};
+use crate::{rpc::RpcClient, Error, HttpBody, HttpService};
 use async_compat::CompatExt;
 use futures::TryFutureExt;
 use http_body_util::{combinators::BoxBody, BodyExt, Empty as EmptyBody, Full as FullBody};
-use hyper::{body::Body, http::Method, Request, Response};
-use std::{collections::HashMap, net::SocketAddr, pin::Pin};
+use hyper::{body::Body, http::Method, Request};
+use std::{collections::HashMap, net::SocketAddr, pin::Pin, sync::Arc};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tower::Service;
 
 pub(crate) mod quic_metadata_protocol_capnp {
     #![allow(clippy::all)]
@@ -15,31 +16,6 @@ pub(crate) mod quic_metadata_protocol_capnp {
 pub const DATA_SIG: [u8; 6] = [0x0A, 0x36, 0xCD, 0x12, 0xA1, 0x3E];
 pub const RPC_SIG: [u8; 6] = [0x52, 0xBB, 0x82, 0x5C, 0xDB, 0x65];
 pub const VERSION: [u8; 2] = *b"01";
-
-pub async fn connect_quic(remote: SocketAddr) -> Result<quinn::Connection, Error> {
-    let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_native_certs::load_native_certs()? {
-        roots.add(&rustls::Certificate((*cert).to_owned()))?;
-    }
-    let mut x = std::io::BufReader::new(include_str!("./cf_root.pem").as_bytes());
-    for x in rustls_pemfile::read_all(&mut x).flatten() {
-        if let rustls_pemfile::Item::X509Certificate(cert) = x {
-            roots.add(&rustls::Certificate((*cert).to_owned()))?;
-        }
-    }
-
-    let client_crypto = rustls::ClientConfig::builder()
-        .with_safe_defaults()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    let client_config = quinn::ClientConfig::new(std::sync::Arc::new(client_crypto));
-    let mut endpoint = quinn::Endpoint::client("[::]:0".parse().unwrap())?;
-    endpoint.set_default_client_config(client_config);
-
-    let conn = endpoint.connect(remote, "quic.cftunnel.com")?.await?;
-
-    Ok(conn)
-}
 
 async fn build_http_request(
     uri: String,
@@ -79,33 +55,58 @@ async fn build_http_request(
     Ok(req)
 }
 
+fn create_tls_client_config() -> Result<rustls::ClientConfig, Error> {
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in rustls_native_certs::load_native_certs()? {
+        roots.add(&rustls::Certificate((*cert).to_owned()))?;
+    }
+    let mut x = std::io::BufReader::new(include_str!("./cf_root.pem").as_bytes());
+    for x in rustls_pemfile::read_all(&mut x).flatten() {
+        if let rustls_pemfile::Item::X509Certificate(cert) = x {
+            roots.add(&rustls::Certificate((*cert).to_owned()))?;
+        }
+    }
+
+    let client_config = rustls::ClientConfig::builder()
+        .with_safe_defaults()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+
+    Ok(client_config)
+}
+
 #[derive(Debug)]
 pub struct Quic {
     conn: quinn::Connection,
     inner: QuicInner,
-    pub rpc: RpcClient,
+    rpc: RpcClient,
 }
 
 impl Quic {
     pub async fn connect(remote: SocketAddr) -> Result<Self, Error> {
-        let conn = connect_quic(remote).await?;
+        let client_crypto = create_tls_client_config()?;
+        let client_config = quinn::ClientConfig::new(Arc::new(client_crypto));
+        let endpoint = quinn::Endpoint::client("[::]:0".parse().unwrap())?;
+        let conn = endpoint
+            .connect_with(client_config, remote, "quic.cftunnel.com")?
+            .await?;
 
         let control_stream = conn.open_bi().await?;
-
         let rpc = RpcClient::new(control_stream);
 
         let inner = QuicInner {};
 
         Ok(Self { conn, rpc, inner })
     }
+}
 
-    pub async fn serve<S>(&self, service: S) -> Result<(), Error>
-    where
-        S: tower::Service<Request<HttpBody>> + Send + Clone + 'static,
-        S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-        S::Response: Into<Response<HttpBody>> + Send,
-        S::Future: Send,
-    {
+#[async_trait::async_trait]
+impl crate::ProtocolImpl for Quic {
+    fn rpc(&self) -> &RpcClient {
+        &self.rpc
+    }
+
+    async fn serve(&mut self, service: HttpService) -> Result<(), Error> {
         loop {
             let (tx, mut rx) = self.conn.accept_bi().await?;
 
@@ -131,17 +132,12 @@ impl Quic {
 struct QuicInner {}
 
 impl QuicInner {
-    async fn handle_data_stream<S>(
+    async fn handle_data_stream(
         &self,
         mut tx: impl AsyncWrite + Send + Sync + Unpin,
         mut rx: impl AsyncRead + Send + Sync + Unpin,
-        mut service: S,
-    ) -> Result<(), Error>
-    where
-        S: tower::Service<Request<HttpBody>> + Send,
-        S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-        S::Response: Into<Response<HttpBody>>,
-    {
+        mut service: HttpService,
+    ) -> Result<(), Error> {
         let mut v = [0; 2];
         rx.read_exact(&mut v).await?;
         if v != VERSION {
@@ -170,18 +166,13 @@ impl QuicInner {
                 let result: Result<_, Box<dyn std::error::Error + Send + Sync>> =
                     build_http_request(uri, metadata, &mut rx)
                         .err_into()
-                        .and_then(|req| async {
-                            match service.call(req).await {
-                                Ok(res) => Ok(res),
-                                Err(e) => Err(e.into()),
-                            }
-                        })
+                        .and_then(|req| service.call(req))
                         .and_then(|res| async {
                             let mut builder = capnp::message::TypedBuilder::<
                                 quic_metadata_protocol_capnp::connect_response::Owned,
                             >::new_default();
 
-                            let (head, body) = res.into().into_parts();
+                            let (head, body) = res.into_parts();
 
                             let root = builder.init_root();
                             let mut m = root.init_metadata((head.headers.len() + 1) as _);

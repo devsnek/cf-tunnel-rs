@@ -35,7 +35,7 @@ struct ProxyService {
 
 impl tower::Service<http::Request<cf_tunnel::HttpBody>> for ProxyService {
     type Response = http::Response<cf_tunnel::HttpBody>;
-    type Error = std::io::Error;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
     type Future = std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
     >;
@@ -128,7 +128,10 @@ async fn main() {
                 url: url.to_owned(),
             };
 
-            tunnel.serve(&try_tunnel, service).await.unwrap();
+            tunnel
+                .serve(&try_tunnel, cf_tunnel::HttpService::new(service), None)
+                .await
+                .unwrap();
         }
     }
 }

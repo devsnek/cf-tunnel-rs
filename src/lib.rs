@@ -1,9 +1,14 @@
+use bytes::Bytes;
+use http_body_util::combinators::BoxBody;
+use hyper::{Request, Response};
 use rand::{seq::SliceRandom, thread_rng};
 use std::net::SocketAddr;
+use tower::{util::BoxCloneService, BoxError};
 use uuid::Uuid;
 
 mod config;
 mod error;
+mod http2;
 mod quic;
 mod rpc;
 pub mod try_tunnel;
@@ -43,12 +48,13 @@ async fn edge_discovery() -> Result<Vec<SocketAddr>, Error> {
     }
 }
 
+pub type HttpBody = BoxBody<Bytes, std::io::Error>;
+pub type HttpService = BoxCloneService<Request<HttpBody>, Response<HttpBody>, BoxError>;
+
 pub struct Tunnel {
     edge_addrs: Vec<SocketAddr>,
     uuid: Uuid,
 }
-
-pub type HttpBody = http_body_util::combinators::BoxBody<bytes::Bytes, std::io::Error>;
 
 impl Tunnel {
     pub async fn new() -> Result<Self, Error> {
@@ -58,19 +64,21 @@ impl Tunnel {
         Ok(Tunnel { edge_addrs, uuid })
     }
 
-    pub async fn serve<S>(&self, config: &impl IntoTunnelConfig, service: S) -> Result<(), Error>
-    where
-        S: tower::Service<hyper::Request<HttpBody>> + Send + Clone + 'static,
-        S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-        S::Response: Into<hyper::Response<HttpBody>> + Send,
-        S::Future: Send,
-    {
+    pub async fn serve(
+        &self,
+        config: &impl IntoTunnelConfig,
+        service: HttpService,
+        protocol: Option<Protocol>,
+    ) -> Result<(), Error> {
         let mut rng = thread_rng();
         let edge_addr = self.edge_addrs.choose(&mut rng).unwrap();
 
-        let quic = quic::Quic::connect(*edge_addr).await?;
+        let mut conn: Box<dyn ProtocolImpl> = match protocol.unwrap_or(Protocol::Quic) {
+            Protocol::Quic => Box::new(quic::Quic::connect(*edge_addr).await?),
+            Protocol::Http2 => Box::new(http2::Http2::connect(*edge_addr).await?),
+        };
 
-        quic.rpc
+        conn.rpc()
             .register_connection(
                 config.account_tag(),
                 config.secret(),
@@ -80,12 +88,24 @@ impl Tunnel {
             )
             .await?;
 
-        let r = quic.serve(service).await;
+        let r = conn.serve(tower::util::BoxCloneService::new(service)).await;
 
-        quic.rpc.unregister_connection().await?;
+        conn.rpc().unregister_connection().await?;
 
         r
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum Protocol {
+    Quic,
+    Http2,
+}
+
+#[async_trait::async_trait]
+trait ProtocolImpl {
+    fn rpc(&self) -> &rpc::RpcClient;
+    async fn serve(&mut self, service: HttpService) -> Result<(), Error>;
 }
 
 pub trait IntoTunnelConfig {

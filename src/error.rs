@@ -38,6 +38,8 @@ pub enum Error {
     ToStrError(#[from] hyper::header::ToStrError),
     #[error(transparent)]
     HttpError(#[from] hyper::http::Error),
+    #[error(transparent)]
+    H2Error(#[from] h2::Error),
     #[error("RPC Error: {0}")]
     RpcError(String),
     #[error("Version mismatch")]
