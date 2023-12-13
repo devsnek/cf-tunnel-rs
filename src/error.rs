@@ -42,6 +42,10 @@ pub enum Error {
     InvalidHeaderValue(#[from] hyper::header::InvalidHeaderValue),
     #[error(transparent)]
     H2Error(#[from] h2::Error),
+    #[error(transparent)]
+    Cloudflare(#[from] cloudflare::framework::Error),
+    #[error(transparent)]
+    CfApiFailure(#[from] cloudflare::framework::response::ApiFailure),
     #[error("RPC Error: {0}")]
     RpcError(String),
     #[error("Version mismatch")]

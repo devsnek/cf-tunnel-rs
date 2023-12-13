@@ -55,7 +55,7 @@ fn create_tls_client_config() -> Result<rustls::ClientConfig, Error> {
     for cert in rustls_native_certs::load_native_certs()? {
         roots.add(&rustls::Certificate((*cert).to_owned()))?;
     }
-    let mut x = std::io::BufReader::new(include_str!("./cf_root.pem").as_bytes());
+    let mut x = std::io::BufReader::new(include_str!("../cf_root.pem").as_bytes());
     for x in rustls_pemfile::read_all(&mut x).flatten() {
         if let rustls_pemfile::Item::X509Certificate(cert) = x {
             roots.add(&rustls::Certificate((*cert).to_owned()))?;

@@ -1,3 +1,4 @@
+use base64::{engine::general_purpose::STANDARD, Engine};
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
 use hyper::{Request, Response};
@@ -6,18 +7,21 @@ use std::net::SocketAddr;
 use tower::{util::BoxCloneService, BoxError};
 use uuid::Uuid;
 
+mod cfapi;
 mod config;
 mod error;
 mod http2;
 mod quic;
+mod quick_tunnel;
 mod rpc;
-pub mod try_tunnel;
 
 // capnp assumes that it exists at the root of the crate :/
 use quic::quic_metadata_protocol_capnp;
 use rpc::tunnelrpc_capnp;
 
+pub use cfapi::CfApi;
 pub use error::Error;
+pub use quick_tunnel::QuickTunnel;
 
 async fn edge_discovery() -> Result<Vec<SocketAddr>, Error> {
     const SRV_SERVICE: &str = "v2-origintunneld";
@@ -66,7 +70,7 @@ impl Tunnel {
 
     pub async fn serve(
         &self,
-        config: &impl IntoTunnelConfig,
+        config: &impl TunnelConfig,
         service: HttpService,
         protocol: Option<Protocol>,
     ) -> Result<(), Error> {
@@ -78,17 +82,12 @@ impl Tunnel {
             Protocol::Http2 => Box::new(http2::Http2::connect(*edge_addr).await?),
         };
 
-        let r = conn
-            .rpc()
-            .register_connection(
-                config.account_tag(),
-                config.secret(),
-                config.id(),
-                0,
-                &self.uuid,
-            )
+        let id = Uuid::parse_str(config.id())?;
+        let secret = STANDARD.decode(config.secret())?;
+
+        conn.rpc()
+            .register_connection(config.account_tag(), &secret, &id, 0, &self.uuid)
             .await?;
-        println!("Serving via {}", r.location);
 
         let r = conn.serve(tower::util::BoxCloneService::new(service)).await;
 
@@ -122,8 +121,22 @@ trait ProtocolImpl {
     async fn serve(&mut self, service: HttpService) -> Result<(), Error>;
 }
 
-pub trait IntoTunnelConfig {
+pub trait TunnelConfig {
     fn account_tag(&self) -> &str;
-    fn secret(&self) -> &[u8];
-    fn id(&self) -> &Uuid;
+    fn secret(&self) -> &str;
+    fn id(&self) -> &str;
+}
+
+impl TunnelConfig for Box<dyn TunnelConfig> {
+    fn account_tag(&self) -> &str {
+        (**self).account_tag()
+    }
+
+    fn secret(&self) -> &str {
+        (**self).secret()
+    }
+
+    fn id(&self) -> &str {
+        (**self).id()
+    }
 }
