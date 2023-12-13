@@ -1,10 +1,8 @@
 use crate::{rpc::RpcClient, Error, HttpBody, HttpService};
+use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine};
 use bytes::Bytes;
 use futures::TryStreamExt;
-use h2::{
-    server::{SendResponse},
-    RecvStream, SendStream,
-};
+use h2::{server::SendResponse, RecvStream, SendStream};
 use http_body_util::{BodyStream, StreamBody};
 use hyper::{body::Frame, Request, Response};
 use std::{
@@ -15,7 +13,7 @@ use std::{
 };
 use tokio::net::TcpStream;
 use tokio_rustls::{
-    rustls::{pki_types::ServerName, ClientConfig, RootCertStore, KeyLogFile},
+    rustls::{pki_types::ServerName, ClientConfig, KeyLogFile, RootCertStore},
     TlsConnector,
 };
 use tokio_util::io::StreamReader;
@@ -74,10 +72,12 @@ impl Http2 {
                 .header("content-type", "application/octet-stream")
                 .body(())
                 .unwrap();
-            let send_stream = send_response
-                .send_response(response, false)?;
+            let send_stream = send_response.send_response(response, false)?;
 
-            RpcClient::new(BodyWriter(send_stream), StreamReader::new(RecvBodyStream(body)))
+            RpcClient::new(
+                BodyWriter(send_stream),
+                StreamReader::new(RecvBodyStream(body)),
+            )
         };
 
         let (tx, rx) = tokio::sync::mpsc::channel(8);
@@ -151,7 +151,26 @@ impl Http2Inner {
                 let response = service.call(request).await.map_err(Into::into).unwrap();
 
                 let (head, body) = response.into().into_parts();
-                let response = Response::from_parts(head, ());
+
+                let mut response = Response::builder()
+                    .status(head.status)
+                    .header("cf-cloudflared-response-meta", r#"{"src": "origin"}"#)
+                    .body(())
+                    .unwrap();
+
+                let mut user_headers = Vec::new();
+                for (k, v) in head.headers.iter() {
+                    if k == "content-type" || k == "content-length" {
+                        response.headers_mut().insert(k, v.to_owned());
+                    }
+                    let k = STANDARD_NO_PAD.encode(k);
+                    let v = STANDARD_NO_PAD.encode(v);
+                    user_headers.push(format!("{}:{}", k, v));
+                }
+                response.headers_mut().insert(
+                    "cf-cloudflared-response-headers",
+                    user_headers.join(";").try_into()?,
+                );
 
                 let mut body_reader =
                     StreamReader::new(BodyStream::new(body).map_ok(|f| f.into_data().unwrap()));
@@ -159,7 +178,7 @@ impl Http2Inner {
 
                 tokio::io::copy(&mut body_reader, &mut body_writer).await?;
 
-                body_writer.0.send_reset(h2::Reason::NO_ERROR);
+                body_writer.0.send_data(Bytes::new(), true)?;
             }
         }
         Ok(())
@@ -199,7 +218,7 @@ impl tokio::io::AsyncWrite for BodyWriter {
     ) -> Poll<Result<(), std::io::Error>> {
         Poll::Ready(
             self.0
-                .send_data(Bytes::new(), false)
+                .send_data(Bytes::new(), true)
                 .map_err(std::io::Error::other),
         )
     }

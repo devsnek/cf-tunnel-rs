@@ -78,7 +78,8 @@ impl Tunnel {
             Protocol::Http2 => Box::new(http2::Http2::connect(*edge_addr).await?),
         };
 
-        let r = conn.rpc()
+        let r = conn
+            .rpc()
             .register_connection(
                 config.account_tag(),
                 config.secret(),

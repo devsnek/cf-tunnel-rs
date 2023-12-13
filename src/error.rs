@@ -39,6 +39,8 @@ pub enum Error {
     #[error(transparent)]
     HttpError(#[from] hyper::http::Error),
     #[error(transparent)]
+    InvalidHeaderValue(#[from] hyper::header::InvalidHeaderValue),
+    #[error(transparent)]
     H2Error(#[from] h2::Error),
     #[error("RPC Error: {0}")]
     RpcError(String),

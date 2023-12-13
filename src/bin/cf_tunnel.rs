@@ -27,7 +27,7 @@ enum Command {
     Try {
         url: ProxyUrl,
         #[arg(short, long)]
-        protocol: Option<cf_tunnel::Protocol>
+        protocol: Option<cf_tunnel::Protocol>,
     },
 }
 
