@@ -1,10 +1,7 @@
 use base64::{engine::general_purpose::STANDARD, Engine};
-use bytes::Bytes;
-use http_body_util::combinators::BoxBody;
-use hyper::{Request, Response};
 use rand::{seq::SliceRandom, thread_rng};
 use std::net::SocketAddr;
-use tower::{util::BoxCloneService, BoxError};
+use tokio::io::DuplexStream;
 use uuid::Uuid;
 
 mod cfapi;
@@ -14,6 +11,7 @@ mod http2;
 mod quic;
 mod quick_tunnel;
 mod rpc;
+mod util;
 
 // capnp assumes that it exists at the root of the crate :/
 use quic::quic_metadata_protocol_capnp;
@@ -52,32 +50,22 @@ async fn edge_discovery() -> Result<Vec<SocketAddr>, Error> {
     }
 }
 
-pub type HttpBody = BoxBody<Bytes, std::io::Error>;
-pub type HttpService = BoxCloneService<Request<HttpBody>, Response<HttpBody>, BoxError>;
-
 pub struct Tunnel {
-    edge_addrs: Vec<SocketAddr>,
-    uuid: Uuid,
+    conn: Box<dyn ProtocolImpl>,
 }
 
 impl Tunnel {
-    pub async fn new() -> Result<Self, Error> {
+    pub async fn new(
+        config: &impl TunnelConfig,
+        protocol: Option<Protocol>,
+    ) -> Result<Self, Error> {
         let edge_addrs = edge_discovery().await?;
         let uuid = Uuid::new_v4();
 
-        Ok(Tunnel { edge_addrs, uuid })
-    }
-
-    pub async fn serve(
-        &self,
-        config: &impl TunnelConfig,
-        service: HttpService,
-        protocol: Option<Protocol>,
-    ) -> Result<(), Error> {
         let mut rng = thread_rng();
-        let edge_addr = self.edge_addrs.choose(&mut rng).unwrap();
+        let edge_addr = edge_addrs.choose(&mut rng).unwrap();
 
-        let mut conn: Box<dyn ProtocolImpl> = match protocol.unwrap_or(Protocol::Quic) {
+        let conn: Box<dyn ProtocolImpl> = match protocol.unwrap_or(Protocol::Quic) {
             Protocol::Quic => Box::new(quic::Quic::connect(*edge_addr).await?),
             Protocol::Http2 => Box::new(http2::Http2::connect(*edge_addr).await?),
         };
@@ -86,14 +74,14 @@ impl Tunnel {
         let secret = STANDARD.decode(config.secret())?;
 
         conn.rpc()
-            .register_connection(config.account_tag(), &secret, &id, 0, &self.uuid)
+            .register_connection(config.account_tag(), &secret, &id, 0, &uuid)
             .await?;
 
-        let r = conn.serve(tower::util::BoxCloneService::new(service)).await;
+        Ok(Tunnel { conn })
+    }
 
-        conn.rpc().unregister_connection().await?;
-
-        r
+    pub async fn accept(&mut self) -> Result<Option<DuplexStream>, Error> {
+        self.conn.accept().await
     }
 }
 
@@ -118,7 +106,7 @@ impl std::str::FromStr for Protocol {
 #[async_trait::async_trait]
 trait ProtocolImpl {
     fn rpc(&self) -> &rpc::RpcClient;
-    async fn serve(&mut self, service: HttpService) -> Result<(), Error>;
+    async fn accept(&mut self) -> Result<Option<DuplexStream>, Error>;
 }
 
 pub trait TunnelConfig {

@@ -1,17 +1,21 @@
-use crate::{rpc::RpcClient, Error, HttpBody, HttpService};
+use crate::{rpc::RpcClient, util::Join, Error};
 use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine};
 use bytes::Bytes;
 use futures::TryStreamExt;
 use h2::{server::SendResponse, RecvStream, SendStream};
 use http_body_util::{BodyStream, StreamBody};
 use hyper::{body::Frame, Request, Response};
+use hyper_util::rt::TokioIo;
 use std::{
     net::SocketAddr,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
 };
-use tokio::net::TcpStream;
+use tokio::{
+    io::{duplex, DuplexStream},
+    net::TcpStream,
+};
 use tokio_rustls::{
     rustls::{pki_types::ServerName, ClientConfig, KeyLogFile, RootCertStore},
     TlsConnector,
@@ -44,7 +48,6 @@ fn create_tls_client_config() -> Result<ClientConfig, Error> {
 pub struct Http2 {
     rx: tokio::sync::mpsc::Receiver<Result<(Request<RecvStream>, SendResponse<Bytes>), h2::Error>>,
     rpc: RpcClient,
-    inner: Http2Inner,
 }
 
 impl Http2 {
@@ -61,8 +64,6 @@ impl Http2 {
             .enable_connect_protocol()
             .handshake(tls)
             .await?;
-
-        let inner = Http2Inner {};
 
         let rpc = {
             let (request, mut send_response) = h2.accept().await.unwrap()?;
@@ -87,7 +88,7 @@ impl Http2 {
             }
         });
 
-        Ok(Self { rx, rpc, inner })
+        Ok(Self { rx, rpc })
     }
 }
 
@@ -97,60 +98,84 @@ impl crate::ProtocolImpl for Http2 {
         &self.rpc
     }
 
-    async fn serve(&mut self, service: HttpService) -> Result<(), Error> {
-        while let Some(request) = self.rx.recv().await {
-            let inner = self.inner.clone();
-            let service = service.clone();
-            tokio::spawn(async move {
-                inner.handle_request(request, service).await.unwrap();
-            });
-        }
+    async fn accept(&mut self) -> Result<Option<DuplexStream>, Error> {
+        match self.rx.recv().await {
+            Some(request) => {
+                let (virt, other) = duplex(4096);
 
-        Ok(())
+                tokio::task::spawn(async move {
+                    handle_request(request, other).await.unwrap();
+                });
+
+                Ok(Some(virt))
+            }
+            None => Ok(None),
+        }
     }
 }
 
-#[derive(Clone, Debug)]
-struct Http2Inner {}
-
-impl Http2Inner {
-    async fn handle_request<S>(
-        &self,
-        request: Result<(Request<RecvStream>, SendResponse<Bytes>), h2::Error>,
-        mut service: S,
-    ) -> Result<(), Error>
-    where
-        S: tower::Service<Request<HttpBody>> + Send,
-        S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-        S::Response: Into<Response<HttpBody>>,
+async fn handle_request(
+    request: Result<(Request<RecvStream>, SendResponse<Bytes>), h2::Error>,
+    mut other_virt: DuplexStream,
+) -> Result<(), Error> {
+    let (request, mut send_response) = request?;
+    match request
+        .headers()
+        .get("cf-cloudflared-proxy-connection-upgrade")
+        .and_then(|h| h.to_str().ok())
     {
-        let (request, mut send_response) = request?;
-        match request
-            .headers()
-            .get("cf-cloudflared-proxy-connection-upgrade")
-            .and_then(|h| h.to_str().ok())
-        {
-            Some("control-stream") => {
-                unreachable!("control");
-            }
-            Some("update-configuration") => {
-                unimplemented!("config");
-            }
-            Some("websocket") => {
-                unimplemented!("websocket");
-            }
-            _ => {
-                if request.headers().contains_key("cf-cloudflared-proxy-src") {
-                    unimplemented!("tcp");
-                }
+        Some("control-stream") => {
+            unreachable!("control");
+        }
+        Some("update-configuration") => {
+            unimplemented!("config");
+        }
+        Some("websocket") => {
+            unimplemented!("websocket");
+        }
+        _ => {
+            if request.headers().contains_key("cf-cloudflared-proxy-src") {
+                let (_, body) = request.into_parts();
+                let response = Response::builder()
+                    .status(200)
+                    .header("cf-cloudflared-response-meta", r#"{"src": "origin"}"#)
+                    .body(())
+                    .unwrap();
 
+                let send_stream = send_response.send_response(response, false)?;
+
+                let body_reader = StreamReader::new(RecvBodyStream(body));
+                let body_writer = BodyWriter(send_stream);
+
+                let mut join = Join::new(body_writer, body_reader);
+
+                tokio::io::copy_bidirectional(&mut other_virt, &mut join).await?;
+                join.split().0 .0.send_data(Bytes::new(), true)?;
+            } else {
                 let (head, body) = request.into_parts();
-                let body = HttpBody::new(StreamBody::new(RecvBodyStream(body).map_ok(Frame::data)));
-                let request = Request::from_parts(head, body);
 
-                let response = service.call(request).await.map_err(Into::into).unwrap();
+                let body = StreamBody::new(RecvBodyStream(body).map_ok(Frame::data));
+                let mut request = Request::builder()
+                    .method(head.method)
+                    .uri(
+                        head.uri
+                            .path_and_query()
+                            .map(|p| p.to_string())
+                            .unwrap_or("/".into()),
+                    )
+                    .header("host", head.uri.host().unwrap())
+                    .body(body)?;
+                request.headers_mut().extend(head.headers);
 
-                let (head, body) = response.into().into_parts();
+                let (mut send_request, connection) =
+                    hyper::client::conn::http1::handshake(TokioIo::new(other_virt)).await?;
+                tokio::task::spawn(async move {
+                    connection.with_upgrades().await.unwrap();
+                });
+                send_request.ready().await?;
+                let response = send_request.send_request(request).await?;
+
+                let (head, body) = response.into_parts();
 
                 let mut response = Response::builder()
                     .status(head.status)
@@ -172,17 +197,21 @@ impl Http2Inner {
                     user_headers.join(";").try_into()?,
                 );
 
-                let mut body_reader =
-                    StreamReader::new(BodyStream::new(body).map_ok(|f| f.into_data().unwrap()));
-                let mut body_writer = BodyWriter(send_response.send_response(response, false)?);
+                let send_stream = send_response.send_response(response, false)?;
+                let mut body_reader = StreamReader::new(
+                    BodyStream::new(body)
+                        .map_ok(|f| f.into_data().unwrap())
+                        .map_err(std::io::Error::other),
+                );
+                let mut body_writer = BodyWriter(send_stream);
 
                 tokio::io::copy(&mut body_reader, &mut body_writer).await?;
 
                 body_writer.0.send_data(Bytes::new(), true)?;
             }
         }
-        Ok(())
     }
+    Ok(())
 }
 
 struct BodyWriter(SendStream<Bytes>);

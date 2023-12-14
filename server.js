@@ -1,9 +1,10 @@
 'use strict';
 
+const { WebSocketServer } = require('ws');
 const http = require('http');
 const { pipeline } = require('node:stream/promises');
 
-http.createServer((req, res) => {
+const server = http.createServer((req, res) => {
   console.log(req.url, req.headers);
   if (req.url === '/stream') {
     fetch('http://httpbin.org/stream-bytes/5000000')
@@ -22,4 +23,22 @@ http.createServer((req, res) => {
     }
     req.pipe(res);
   }
+});
+
+const wss = new WebSocketServer({ server });
+
+wss.on('connection', (ws, req) => {
+  console.log(req.url, req.headers);
+  ws.on('message', (data) => {
+    ws.send(data);
+  });
+});
+
+server.listen(8080);
+
+/*
+require('net').createServer((c) => {
+  c.setEncoding('utf8');
+  c.on('data', console.log);
 }).listen(8080);
+*/
