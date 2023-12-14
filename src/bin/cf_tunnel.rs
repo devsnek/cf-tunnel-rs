@@ -1,5 +1,5 @@
 use base64::{engine::general_purpose::STANDARD, Engine};
-use cf_tunnel::{CfApi, QuickTunnel, Tunnel, TunnelConfig};
+use cf_tunnel::{CfApi, EdgeDiscovery, QuickTunnel, Tunnel, TunnelConfig};
 use clap::Parser;
 use http::uri::Authority;
 use rand::{thread_rng, Fill};
@@ -14,6 +14,8 @@ struct Args {
     protocol: Option<cf_tunnel::Protocol>,
     #[arg(short, long)]
     account_token: Option<String>,
+    #[arg(short, long)]
+    region: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -58,6 +60,7 @@ async fn main() {
         url,
         protocol,
         account_token,
+        region,
     } = Args::parse();
 
     let config: Box<dyn TunnelConfig> = match name {
@@ -98,7 +101,9 @@ async fn main() {
         }
     };
 
-    let mut tunnel = Tunnel::new(&config, protocol).await.unwrap();
+    let edge = EdgeDiscovery::new(region).await.unwrap();
+
+    let mut tunnel = Tunnel::new(&edge, &config, protocol).await.unwrap();
 
     while let Some(mut connection) = tunnel.accept().await.unwrap() {
         let url = url.clone().to_string();

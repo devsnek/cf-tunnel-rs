@@ -21,32 +21,43 @@ pub use cfapi::CfApi;
 pub use error::Error;
 pub use quick_tunnel::QuickTunnel;
 
-async fn edge_discovery() -> Result<Vec<SocketAddr>, Error> {
-    const SRV_SERVICE: &str = "v2-origintunneld";
-    const SRV_NAME: &str = "argotunnel.com";
+const SRV_SERVICE: &str = "v2-origintunneld";
+const SRV_NAME: &str = "argotunnel.com";
 
-    let name = format!("_{SRV_SERVICE}._tcp.{SRV_NAME}.");
+pub struct EdgeDiscovery {
+    addrs: Vec<SocketAddr>,
+}
 
-    let resolver = hickory_resolver::AsyncResolver::tokio(
-        hickory_resolver::config::ResolverConfig::default(),
-        hickory_resolver::config::ResolverOpts::default(),
-    );
+impl EdgeDiscovery {
+    pub async fn new(region: Option<String>) -> Result<Self, Error> {
+        let region_prefix = if let Some(region) = region {
+            format!("{region}-")
+        } else {
+            String::new()
+        };
+        let name = format!("_{}{SRV_SERVICE}._tcp.{SRV_NAME}.", region_prefix);
 
-    let srvs = resolver.srv_lookup(name).await?;
+        let resolver = hickory_resolver::AsyncResolver::tokio(
+            hickory_resolver::config::ResolverConfig::default(),
+            hickory_resolver::config::ResolverOpts::default(),
+        );
 
-    let mut result: Vec<SocketAddr> = vec![];
+        let srvs = resolver.srv_lookup(name).await?;
 
-    for srv in srvs.iter() {
-        let ips = resolver.lookup_ip(srv.target().to_ascii()).await?;
-        for ip in ips {
-            result.push((ip, srv.port()).into());
+        let mut addrs: Vec<SocketAddr> = vec![];
+
+        for srv in srvs.iter() {
+            let ips = resolver.lookup_ip(srv.target().to_ascii()).await?;
+            for ip in ips {
+                addrs.push((ip, srv.port()).into());
+            }
         }
-    }
 
-    if result.is_empty() {
-        Err(Error::EdgeDiscoveryFailed)
-    } else {
-        Ok(result)
+        if addrs.is_empty() {
+            Err(Error::EdgeDiscoveryFailed)
+        } else {
+            Ok(Self { addrs })
+        }
     }
 }
 
@@ -56,14 +67,14 @@ pub struct Tunnel {
 
 impl Tunnel {
     pub async fn new(
+        edge_discovery: &EdgeDiscovery,
         config: &impl TunnelConfig,
         protocol: Option<Protocol>,
     ) -> Result<Self, Error> {
-        let edge_addrs = edge_discovery().await?;
         let uuid = Uuid::new_v4();
 
         let mut rng = thread_rng();
-        let edge_addr = edge_addrs.choose(&mut rng).unwrap();
+        let edge_addr = edge_discovery.addrs.choose(&mut rng).unwrap();
 
         let conn: Box<dyn ProtocolImpl> = match protocol.unwrap_or(Protocol::Quic) {
             Protocol::Quic => Box::new(quic::Quic::connect(*edge_addr).await?),
