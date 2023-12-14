@@ -3,8 +3,8 @@ use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine};
 use bytes::Bytes;
 use futures::TryStreamExt;
 use h2::{server::SendResponse, RecvStream, SendStream};
-use http_body_util::{BodyStream, StreamBody};
-use hyper::{body::Frame, Request, Response};
+use http_body_util::{combinators::BoxBody, BodyStream, Empty as EmptyBody, Full as FullBody};
+use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use std::{
     net::SocketAddr,
@@ -13,7 +13,7 @@ use std::{
     task::{Context, Poll},
 };
 use tokio::{
-    io::{duplex, DuplexStream},
+    io::{duplex, AsyncReadExt, DuplexStream},
     net::TcpStream,
 };
 use tokio_rustls::{
@@ -68,11 +68,7 @@ impl Http2 {
         let rpc = {
             let (request, mut send_response) = h2.accept().await.unwrap()?;
             let (_head, body) = request.into_parts();
-            let response = Response::builder()
-                .status(200)
-                .header("content-type", "application/octet-stream")
-                .body(())
-                .unwrap();
+            let response = Response::builder().status(200).body(()).unwrap();
             let send_stream = send_response.send_response(response, false)?;
 
             RpcClient::new(
@@ -130,12 +126,9 @@ async fn handle_request(
         Some("update-configuration") => {
             unimplemented!("config");
         }
-        Some("websocket") => {
-            unimplemented!("websocket");
-        }
         _ => {
             if request.headers().contains_key("cf-cloudflared-proxy-src") {
-                let (_, body) = request.into_parts();
+                let (_, recv_stream) = request.into_parts();
                 let response = Response::builder()
                     .status(200)
                     .header("cf-cloudflared-response-meta", r#"{"src": "origin"}"#)
@@ -144,17 +137,28 @@ async fn handle_request(
 
                 let send_stream = send_response.send_response(response, false)?;
 
-                let body_reader = StreamReader::new(RecvBodyStream(body));
+                let body_reader = StreamReader::new(RecvBodyStream(recv_stream));
                 let body_writer = BodyWriter(send_stream);
 
                 let mut join = Join::new(body_writer, body_reader);
 
                 tokio::io::copy_bidirectional(&mut other_virt, &mut join).await?;
-                join.split().0 .0.send_data(Bytes::new(), true)?;
+                let (mut tx, _rx) = join.split();
+                tx.0.send_data(Bytes::new(), true)?;
             } else {
-                let (head, body) = request.into_parts();
+                let (head, recv_stream) = request.into_parts();
 
-                let body = StreamBody::new(RecvBodyStream(body).map_ok(Frame::data));
+                let (body, recv_stream) = if let Some(len) = head.headers.get("content-length") {
+                    let mut body = vec![0; len.to_str()?.parse()?];
+                    let mut reader = StreamReader::new(RecvBodyStream(recv_stream));
+                    reader.read_exact(&mut body).await?;
+                    (
+                        BoxBody::new(FullBody::new(Bytes::from(body))),
+                        reader.into_inner().0,
+                    )
+                } else {
+                    (BoxBody::new(EmptyBody::new()), recv_stream)
+                };
                 let mut request = Request::builder()
                     .method(head.method)
                     .uri(
@@ -167,6 +171,24 @@ async fn handle_request(
                     .body(body)?;
                 request.headers_mut().extend(head.headers);
 
+                if request
+                    .headers()
+                    .get("cf-cloudflared-proxy-connection-upgrade")
+                    .and_then(|h| h.to_str().ok())
+                    == Some("websocket")
+                {
+                    request
+                        .headers_mut()
+                        .insert("connection", "upgrade".try_into()?);
+                    request
+                        .headers_mut()
+                        .insert("upgrade", "websocket".try_into()?);
+                }
+
+                request
+                    .headers_mut()
+                    .remove("cf-cloudflared-proxy-connection-upgrade");
+
                 let (mut send_request, connection) =
                     hyper::client::conn::http1::handshake(TokioIo::new(other_virt)).await?;
                 tokio::task::spawn(async move {
@@ -175,39 +197,57 @@ async fn handle_request(
                 send_request.ready().await?;
                 let response = send_request.send_request(request).await?;
 
-                let (head, body) = response.into_parts();
-
-                let mut response = Response::builder()
-                    .status(head.status)
+                let mut h2response = Response::builder()
+                    .status(if response.status() == 101 {
+                        200
+                    } else {
+                        response.status().as_u16()
+                    })
                     .header("cf-cloudflared-response-meta", r#"{"src": "origin"}"#)
-                    .body(())
-                    .unwrap();
+                    .body(())?;
 
                 let mut user_headers = Vec::new();
-                for (k, v) in head.headers.iter() {
+                for (k, v) in response.headers().iter() {
                     if k == "content-type" || k == "content-length" {
-                        response.headers_mut().insert(k, v.to_owned());
+                        h2response.headers_mut().insert(k, v.to_owned());
                     }
                     let k = STANDARD_NO_PAD.encode(k);
                     let v = STANDARD_NO_PAD.encode(v);
                     user_headers.push(format!("{}:{}", k, v));
                 }
-                response.headers_mut().insert(
+                h2response.headers_mut().insert(
                     "cf-cloudflared-response-headers",
                     user_headers.join(";").try_into()?,
                 );
 
-                let send_stream = send_response.send_response(response, false)?;
-                let mut body_reader = StreamReader::new(
-                    BodyStream::new(body)
-                        .map_ok(|f| f.into_data().unwrap())
-                        .map_err(std::io::Error::other),
-                );
-                let mut body_writer = BodyWriter(send_stream);
+                let send_stream = send_response.send_response(h2response, false)?;
 
-                tokio::io::copy(&mut body_reader, &mut body_writer).await?;
+                if response.status() == 101 {
+                    let upgrade = hyper::upgrade::on(response).await?;
+                    let parts = upgrade.downcast::<TokioIo<DuplexStream>>().unwrap();
+                    let mut other_virt = parts.io.into_inner();
 
-                body_writer.0.send_data(Bytes::new(), true)?;
+                    let body_reader = StreamReader::new(RecvBodyStream(recv_stream));
+                    let body_writer = BodyWriter(send_stream);
+
+                    let mut join = Join::new(body_writer, body_reader);
+
+                    tokio::io::copy_bidirectional(&mut other_virt, &mut join).await?;
+                    let (mut tx, _rx) = join.split();
+                    tx.0.send_data(Bytes::new(), true)?;
+                } else {
+                    let (_, body) = response.into_parts();
+                    let mut body_reader = StreamReader::new(
+                        BodyStream::new(body)
+                            .map_ok(|f| f.into_data().unwrap())
+                            .map_err(std::io::Error::other),
+                    );
+                    let mut body_writer = BodyWriter(send_stream);
+
+                    tokio::io::copy(&mut body_reader, &mut body_writer).await?;
+
+                    body_writer.0.send_data(Bytes::new(), true)?;
+                }
             }
         }
     }
